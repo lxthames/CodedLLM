@@ -1,0 +1,22 @@
+{
+  "name": "CodedLLM-CUDA-Dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": ["--gpus", "all"],
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "xaver.clang-format"
+      ],
+      "settings": {
+        "C_Cpp.default.cppStandard": "c++17",
+        "cmake.configureOnOpen": true
+      }
+    }
+  }
+}

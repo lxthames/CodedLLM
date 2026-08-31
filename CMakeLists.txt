@@ -20,6 +20,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(codedllm
   src/cpu_reference.cpp
+  src/coding/graph.cpp
   kernels/sparse_decoder.cu
 )
 target_include_directories(codedllm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -33,7 +34,10 @@ set_target_properties(codedllm PROPERTIES
 enable_testing()
 include(GoogleTest)
 
-add_executable(test_decoder tests/test_decoder.cpp)
+add_executable(test_decoder
+  tests/test_decoder.cpp
+  tests/unit/test_core_types.cpp
+)
 target_link_libraries(test_decoder PRIVATE codedllm GTest::gtest_main)
 set_target_properties(test_decoder PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "codedllm/coding/codec.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -15,5 +17,8 @@ void run_sparse_decode_cpu(const std::uint32_t* shard_a,
 void run_sparse_decode_cuda(const std::uint32_t* shard_a,
                             const std::uint32_t* shard_b,
                             std::uint32_t* reconstructed_c, std::size_t size);
+
+// Executes a recoverable DecodePlan over host-resident word shards.
+void run_decode_plan_cuda(const DecodePlan& plan, coding::ShardSlots& shards);
 
 }  // namespace codedllm

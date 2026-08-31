@@ -20,6 +20,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(codedllm
   src/cpu_reference.cpp
+  src/coding/codec.cpp
   src/coding/graph.cpp
   kernels/sparse_decoder.cu
 )
@@ -37,6 +38,7 @@ include(GoogleTest)
 add_executable(test_decoder
   tests/test_decoder.cpp
   tests/unit/test_core_types.cpp
+  tests/unit/test_codec.cpp
 )
 target_link_libraries(test_decoder PRIVATE codedllm GTest::gtest_main)
 set_target_properties(test_decoder PROPERTIES

@@ -117,5 +117,45 @@ TEST(CodecTest, CudaUsesDynamicDegreePathWithVectorTail) {
   EXPECT_EQ(*shards.at(7), expected);
 }
 
+TEST(CodecTest, CudaDeviceContextSupportsRepeatedKernelOnlyLaunches) {
+  const std::vector<WordShard> systematic_shards = MakeSystematicShards();
+  const std::vector<WordShard> parity_shards =
+      coding::encode_parity_cpu(MakeThreeDataOneParityGraph(), systematic_shards);
+  ShardSlots shards = {std::nullopt, systematic_shards.at(1),
+                       systematic_shards.at(2), parity_shards.at(0)};
+  std::unique_ptr<DeviceDecodeContext> context =
+      prepare_decode_plan_cuda(MakeRecoverFirstShardPlan(), shards);
+
+  launch_decode_plan_cuda(*context);
+  launch_decode_plan_cuda(*context);
+  synchronize_decode_plan_cuda(*context);
+  download_decode_results_cuda(*context, shards);
+
+  ASSERT_TRUE(shards.at(0).has_value());
+  EXPECT_EQ(*shards.at(0), systematic_shards.at(0));
+}
+
+TEST(CodecTest, CudaDeviceContextExecutesDependentPlanRepeatedly) {
+  ShardSlots shards = {WordShard{0x01020304U, 0x11121314U},
+                       WordShard{0xA0B0C0D0U, 0x01010101U}, std::nullopt,
+                       std::nullopt};
+  const DecodePlan plan = {
+      {{/*output=*/2, /*sources=*/{0, 1}},
+       {/*output=*/3, /*sources=*/{2, 0}}},
+      {{}, {0}}, true};
+  std::unique_ptr<DeviceDecodeContext> context =
+      prepare_decode_plan_cuda(plan, shards);
+
+  launch_decode_plan_cuda(*context);
+  launch_decode_plan_cuda(*context);
+  synchronize_decode_plan_cuda(*context);
+  download_decode_results_cuda(*context, shards);
+
+  ASSERT_TRUE(shards.at(2).has_value());
+  ASSERT_TRUE(shards.at(3).has_value());
+  EXPECT_EQ(*shards.at(2), (WordShard{0xA1B2C3D4U, 0x10131215U}));
+  EXPECT_EQ(*shards.at(3), (WordShard{0xA0B0C0D0U, 0x01010101U}));
+}
+
 }  // namespace
 }  // namespace codedllm

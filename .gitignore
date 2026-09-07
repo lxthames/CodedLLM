@@ -1,2 +1,4 @@
 /HelpingMatrials/
 /build/
+__pycache__/
+*.pyc

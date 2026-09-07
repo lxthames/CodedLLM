@@ -41,8 +41,8 @@ representation.
 
 ## Current status
 
-The repository currently provides the foundational coding and CUDA execution
-platform:
+The repository now provides an end-to-end research prototype spanning coding,
+CUDA execution, control-plane simulation, and a serving integration boundary:
 
 - validated `ShardLayout`, immutable `CodeGraph`, and `DecodePlan` contracts;
 - CPU parity generation and bit-exact decode-plan execution;
@@ -52,13 +52,21 @@ platform:
 - hardware-aware launch configuration using CUDA occupancy APIs;
 - reusable device-resident buffers, source tables, streams, and timing events;
 - sequential execution of dependent multi-operation decode plans;
-- GoogleTest CPU/GPU differential tests;
+- deterministic sparse-graph generation and multi-erasure peeling plans;
+- randomized, bit-exact CPU/GPU differential recovery tests;
+- cost-based recovery policy and deterministic shard-arrival simulation;
+- cluster-level bounded recovery queues and KV-shaped workload generation;
+- multi-seed Wait, CodedLLM, and full-replication experiments with confidence
+  intervals;
+- transport and recovery-executor interfaces with cancellation and late-arrival
+  handling;
+- a bounded asynchronous CUDA recovery executor with phase timing;
 - Google Benchmark kernel, end-to-end, roofline, and dependent-plan benchmarks;
 - a CUDA device information utility; and
 - a targeted Nsight Compute profiling script.
 
-The sparse graph generator, peeling decoder, recovery policy, straggler simulator,
-and serving-engine integration are future research stages. This is currently a
+The transport boundary currently uses injectable interfaces and test transports;
+it is not yet connected to a production RPC or serving engine. CodedLLM remains a
 research prototype, not a production serving library.
 
 ## Repository layout
@@ -66,12 +74,14 @@ research prototype, not a production serving library.
 ```text
 include/codedllm/       Core, coding, and CUDA tuning interfaces
 include/kernels/        Host-facing decoder interface
-src/                    Pure C++ graph, codec, and CPU reference code
+src/                    Coding, runtime, simulation, and CUDA adapter code
 kernels/                CUDA kernels and resource-management utilities
-tests/                  GoogleTest contract and CPU/GPU correctness tests
+tests/                  Unit, property, and CPU/GPU integration tests
 benchmarks/             Kernel, roofline, and decode-plan microbenchmarks
+experiments/            KV-shaped parameter-sweep executable
+benchmarks/results/     Raw and confidence-aggregated experiment results
 tools/                  CUDA device capability reporting
-scripts/                Reproducible profiling commands
+scripts/                Profiling and experiment-analysis commands
 .devcontainer/          CUDA 12.4 development container
 HelpingMatrials/        Research overview, roadmap, and reference material
 ```
@@ -167,14 +177,15 @@ using Nsight Compute through WSL2.
 
 ## Research roadmap
 
-The next major milestones are:
+Completed research milestones include sparse graph construction, peeling,
+CPU/GPU differential validation, deterministic control-plane simulation, bounded
+recovery queues, KV-shaped multi-seed experiments, and the serving integration
+boundary. The next milestones are:
 
-1. deterministic sparse graph construction and multi-erasure peeling;
-2. randomized recoverability and CPU/GPU differential testing;
-3. deterministic shard-arrival and straggler simulation;
-4. wait-versus-recover latency policy and bounded recovery queue;
-5. KV-shaped end-to-end experiments; and
-6. integration with a disaggregated serving or transport prototype.
+1. connect `ShardTransport` to a concrete RPC or disaggregated serving runtime;
+2. replay production-derived KV-transfer and straggler traces;
+3. compare latency under storage- and network-normalized resource budgets; and
+4. validate multi-GPU placement, failure handling, and sustained-load behavior.
 
 The central research question is not merely whether XOR is fast. CodedLLM must show
 that complete recovery, including planning, data movement, queueing, and handoff,

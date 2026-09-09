@@ -35,6 +35,7 @@ struct SweepOptions {
   std::uint32_t base_seed = 20260901U;
   std::size_t seed_count = 20;
   std::size_t num_requests = 1000;
+  std::vector<double> arrival_rates_hz{2000.0};
 };
 
 std::uint64_t ParseUnsigned(const std::string& value, const std::string& option) {
@@ -46,6 +47,26 @@ std::uint64_t ParseUnsigned(const std::string& value, const std::string& option)
   return parsed;
 }
 
+std::vector<double> ParseArrivalRates(const std::string& value) {
+  std::vector<double> rates;
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    const std::size_t delimiter = value.find(',', start);
+    const std::string rate_text = value.substr(start, delimiter - start);
+    std::size_t parsed_characters = 0;
+    const double rate = std::stod(rate_text, &parsed_characters);
+    if (parsed_characters != rate_text.size() || !std::isfinite(rate) || rate <= 0.0) {
+      throw std::invalid_argument("Invalid value for --arrival-rates-hz");
+    }
+    rates.push_back(rate);
+    if (delimiter == std::string::npos) {
+      break;
+    }
+    start = delimiter + 1;
+  }
+  return rates;
+}
+
 SweepOptions ParseOptions(int argc, char** argv) {
   SweepOptions options;
   for (int argument = 1; argument < argc; argument += 2) {
@@ -53,16 +74,22 @@ SweepOptions ParseOptions(int argc, char** argv) {
       throw std::invalid_argument("Every sweep option requires a value");
     }
     const std::string option = argv[argument];
-    const std::uint64_t value = ParseUnsigned(argv[argument + 1], option);
+    const std::string value = argv[argument + 1];
+    if (option == "--arrival-rates-hz") {
+      options.arrival_rates_hz = ParseArrivalRates(value);
+      continue;
+    }
+
+    const std::uint64_t parsed = ParseUnsigned(value, option);
     if (option == "--base-seed") {
-      if (value > std::numeric_limits<std::uint32_t>::max()) {
+      if (parsed > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("--base-seed exceeds uint32_t");
       }
-      options.base_seed = static_cast<std::uint32_t>(value);
+      options.base_seed = static_cast<std::uint32_t>(parsed);
     } else if (option == "--seed-count") {
-      options.seed_count = static_cast<std::size_t>(value);
+      options.seed_count = static_cast<std::size_t>(parsed);
     } else if (option == "--num-requests") {
-      options.num_requests = static_cast<std::size_t>(value);
+      options.num_requests = static_cast<std::size_t>(parsed);
     } else {
       throw std::invalid_argument("Unknown sweep option: " + option);
     }
@@ -204,43 +231,46 @@ int main(int argc, char** argv) {
     for (std::size_t seed_offset = 0; seed_offset < options.seed_count; ++seed_offset) {
       const std::uint32_t seed =
           options.base_seed + static_cast<std::uint32_t>(seed_offset);
-      for (const double straggler_probability : straggler_probabilities) {
-        for (const std::size_t parity_count : parity_counts) {
-          const WorkloadConfig workload{options.num_requests,     2000.0,
-                                        straggler_probability,
-                                        /*normal_mean=*/2ms,
-                                        /*normal_stddev=*/400us,
-                                        /*straggler_mean=*/20ms,
-                                        /*straggler_stddev=*/4ms, seed};
-          const WorkloadGenerator generator(workload, kSystematicShards, parity_count);
-          const std::vector<GlobalArrivalEvent> base_events = generator.Generate();
-          const std::vector<GlobalArrivalEvent> replicated_events =
-              ApplyReplication(base_events, workload, seed ^ 0xC2B2AE35U);
-          const codedllm::coding::BipartiteGraph graph =
-              codedllm::coding::GenerateRegularGraph(
-                  kSystematicShards, parity_count, kDegree,
-                  seed ^ static_cast<std::uint32_t>(parity_count));
+      for (const double arrival_rate_hz : options.arrival_rates_hz) {
+        for (const double straggler_probability : straggler_probabilities) {
+          for (const std::size_t parity_count : parity_counts) {
+            const WorkloadConfig workload{options.num_requests,     arrival_rate_hz,
+                                          straggler_probability,
+                                          /*normal_mean=*/2ms,
+                                          /*normal_stddev=*/400us,
+                                          /*straggler_mean=*/20ms,
+                                          /*straggler_stddev=*/4ms, seed};
+            const WorkloadGenerator generator(workload, kSystematicShards,
+                                              parity_count);
+            const std::vector<GlobalArrivalEvent> base_events = generator.Generate();
+            const std::vector<GlobalArrivalEvent> replicated_events =
+                ApplyReplication(base_events, workload, seed ^ 0xC2B2AE35U);
+            const codedllm::coding::BipartiteGraph graph =
+                codedllm::coding::GenerateRegularGraph(
+                    kSystematicShards, parity_count, kDegree,
+                    seed ^ static_cast<std::uint32_t>(parity_count));
 
-          for (const std::size_t queue_depth : queue_depths) {
-            for (const std::size_t concurrency : concurrency_limits) {
-              const auto wait_metrics =
-                  RunStrategy(graph, base_events, /*concurrency=*/1,
-                              /*queue_depth=*/0, decode_time);
-              const auto replication_metrics =
-                  RunStrategy(graph, replicated_events, /*concurrency=*/1,
-                              /*queue_depth=*/0, decode_time);
-              const auto coded_metrics = RunStrategy(graph, base_events, concurrency,
-                                                     queue_depth, decode_time);
+            for (const std::size_t queue_depth : queue_depths) {
+              for (const std::size_t concurrency : concurrency_limits) {
+                const auto wait_metrics =
+                    RunStrategy(graph, base_events, /*concurrency=*/1,
+                                /*queue_depth=*/0, decode_time);
+                const auto replication_metrics =
+                    RunStrategy(graph, replicated_events, /*concurrency=*/1,
+                                /*queue_depth=*/0, decode_time);
+                const auto coded_metrics = RunStrategy(graph, base_events, concurrency,
+                                                       queue_depth, decode_time);
 
-              PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
-                       kShardSizeMiB, queue_depth, concurrency, "wait",
-                       Summarize(wait_metrics, false));
-              PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
-                       kShardSizeMiB, queue_depth, concurrency, "replication",
-                       Summarize(replication_metrics, false));
-              PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
-                       kShardSizeMiB, queue_depth, concurrency, "codedllm",
-                       Summarize(coded_metrics, true));
+                PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
+                         kShardSizeMiB, queue_depth, concurrency, "wait",
+                         Summarize(wait_metrics, false));
+                PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
+                         kShardSizeMiB, queue_depth, concurrency, "replication",
+                         Summarize(replication_metrics, false));
+                PrintRow(seed, workload, kSystematicShards, parity_count, kDegree,
+                         kShardSizeMiB, queue_depth, concurrency, "codedllm",
+                         Summarize(coded_metrics, true));
+              }
             }
           }
         }

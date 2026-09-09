@@ -1,4 +1,10 @@
 /HelpingMatrials/
 /build/
+/build-*/
+/cmake-build-*/
+/artifacts/
+/.claude/
 __pycache__/
 *.pyc
+*.ncu-rep
+CLAUDE.md

@@ -34,6 +34,13 @@ void ValidateConfig(const WorkloadConfig& config) {
   }
 }
 
+void ValidateSystematicShardCount(std::size_t systematic_shard_count) {
+  if (systematic_shard_count == 0 ||
+      systematic_shard_count > std::numeric_limits<ShardId>::max()) {
+    throw std::invalid_argument("Systematic shard count is out of bounds");
+  }
+}
+
 std::vector<std::chrono::microseconds>
 GenerateRequestArrivalTimes(const WorkloadConfig& config) {
   std::mt19937 generator(config.seed ^ kArrivalSeedSalt);
@@ -75,6 +82,25 @@ private:
   std::normal_distribution<double> straggler_;
 };
 
+void ValidateReplicationEvents(
+    const std::vector<GlobalArrivalEvent>& events,
+    const std::vector<std::chrono::microseconds>& request_arrivals,
+    std::size_t systematic_shard_count) {
+  for (const GlobalArrivalEvent& event : events) {
+    if (event.request_id >= request_arrivals.size()) {
+      throw std::invalid_argument("Replication event request ID is out of bounds");
+    }
+    if (event.request_start_time != request_arrivals.at(event.request_id)) {
+      throw std::invalid_argument(
+          "Replication events do not match the workload request schedule");
+    }
+  }
+}
+
+bool IsSelected(ShardId shard_id, const std::vector<ShardId>& selected) {
+  return std::find(selected.begin(), selected.end(), shard_id) != selected.end();
+}
+
 } // namespace
 
 WorkloadGenerator::WorkloadGenerator(WorkloadConfig config,
@@ -83,9 +109,7 @@ WorkloadGenerator::WorkloadGenerator(WorkloadConfig config,
     : config_(std::move(config)), systematic_shard_count_(systematic_shard_count),
       parity_shard_count_(parity_shard_count) {
   ValidateConfig(config_);
-  if (systematic_shard_count == 0) {
-    throw std::invalid_argument("Workload requires at least one systematic shard");
-  }
+  ValidateSystematicShardCount(systematic_shard_count);
   const std::uint64_t total_shards =
       static_cast<std::uint64_t>(systematic_shard_count) +
       static_cast<std::uint64_t>(parity_shard_count);
@@ -113,22 +137,75 @@ std::vector<GlobalArrivalEvent> WorkloadGenerator::Generate() const {
   return events;
 }
 
+std::vector<ShardId> SelectCapacityNormalizedReplicas(
+    std::size_t request_id, std::size_t systematic_shard_count,
+    std::size_t replica_count, std::uint32_t replication_seed) {
+  ValidateSystematicShardCount(systematic_shard_count);
+  if (replica_count > systematic_shard_count) {
+    throw std::invalid_argument("Replica count exceeds systematic shard count");
+  }
+
+  std::vector<ShardId> permutation(systematic_shard_count);
+  for (std::size_t shard = 0; shard < systematic_shard_count; ++shard) {
+    permutation.at(shard) = static_cast<ShardId>(shard);
+  }
+  std::mt19937 generator(replication_seed);
+  std::shuffle(permutation.begin(), permutation.end(), generator);
+
+  std::vector<ShardId> selected;
+  selected.reserve(replica_count);
+  const std::size_t start =
+      (request_id % systematic_shard_count) * replica_count % systematic_shard_count;
+  for (std::size_t replica = 0; replica < replica_count; ++replica) {
+    selected.push_back(permutation.at((start + replica) % systematic_shard_count));
+  }
+  return selected;
+}
+
 std::vector<GlobalArrivalEvent>
 ApplyReplication(const std::vector<GlobalArrivalEvent>& events,
-                 const WorkloadConfig& config, std::uint32_t replication_seed) {
+                 const WorkloadConfig& config, std::size_t systematic_shard_count,
+                 std::uint32_t replication_seed) {
   ValidateConfig(config);
+  ValidateSystematicShardCount(systematic_shard_count);
   const std::vector<std::chrono::microseconds> request_arrivals =
       GenerateRequestArrivalTimes(config);
+  ValidateReplicationEvents(events, request_arrivals, systematic_shard_count);
   DelaySampler replica_delays(config, replication_seed);
 
   std::vector<GlobalArrivalEvent> replicated = events;
   for (GlobalArrivalEvent& event : replicated) {
-    if (event.request_id >= request_arrivals.size()) {
-      throw std::invalid_argument("Replication event request ID is out of bounds");
+    if (event.shard_id >= systematic_shard_count) {
+      continue;
     }
-    if (event.request_start_time != request_arrivals.at(event.request_id)) {
-      throw std::invalid_argument(
-          "Replication events do not match the workload request schedule");
+    const std::chrono::microseconds replica_arrival =
+        request_arrivals.at(event.request_id) + replica_delays.Sample();
+    event.arrival_time = std::min(event.arrival_time, replica_arrival);
+  }
+  return replicated;
+}
+
+std::vector<GlobalArrivalEvent> ApplyCapacityNormalizedReplication(
+    const std::vector<GlobalArrivalEvent>& events, const WorkloadConfig& config,
+    std::size_t systematic_shard_count, std::size_t replica_count,
+    std::uint32_t replication_seed) {
+  ValidateConfig(config);
+  ValidateSystematicShardCount(systematic_shard_count);
+  if (replica_count > systematic_shard_count) {
+    throw std::invalid_argument("Replica count exceeds systematic shard count");
+  }
+  const std::vector<std::chrono::microseconds> request_arrivals =
+      GenerateRequestArrivalTimes(config);
+  ValidateReplicationEvents(events, request_arrivals, systematic_shard_count);
+  DelaySampler replica_delays(config, replication_seed);
+
+  std::vector<GlobalArrivalEvent> replicated = events;
+  for (GlobalArrivalEvent& event : replicated) {
+    if (event.shard_id >= systematic_shard_count ||
+        !IsSelected(event.shard_id, SelectCapacityNormalizedReplicas(
+                                        event.request_id, systematic_shard_count,
+                                        replica_count, replication_seed))) {
+      continue;
     }
     const std::chrono::microseconds replica_arrival =
         request_arrivals.at(event.request_id) + replica_delays.Sample();

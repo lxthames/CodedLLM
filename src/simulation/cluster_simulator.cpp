@@ -8,13 +8,19 @@
 
 namespace codedllm::simulation {
 
-ClusterSimulator::ClusterSimulator(coding::BipartiteGraph graph,
-                                   coding::DecodePlanner planner,
-                                   RecoveryQueue recovery_queue)
+ClusterSimulator::ClusterSimulator(
+    coding::BipartiteGraph graph, coding::DecodePlanner planner,
+    RecoveryQueue recovery_queue,
+    RecoveryServiceTimeEstimator estimate_recovery_service_time)
     : systematic_shard_count_(graph.systematic_shard_count),
       parity_shard_count_(graph.parity_shard_count),
       recovery_queue_(std::move(recovery_queue)),
-      policy_(std::move(graph), std::move(planner)) {}
+      policy_(std::move(graph), std::move(planner)),
+      estimate_recovery_service_time_(std::move(estimate_recovery_service_time)) {
+  if (!estimate_recovery_service_time_) {
+    throw std::invalid_argument("ClusterSimulator requires a recovery-cost estimator");
+  }
+}
 
 std::map<std::size_t, RequestMetrics>
 ClusterSimulator::Run(std::vector<GlobalArrivalEvent> events,
@@ -48,6 +54,8 @@ ClusterSimulator::Run(std::vector<GlobalArrivalEvent> events,
   std::map<std::size_t, std::chrono::microseconds> natural_completion_times;
   std::map<std::size_t, std::chrono::microseconds> recovery_completion_times;
   std::map<std::size_t, bool> recovery_rejected;
+  std::map<std::size_t, bool> recovery_waited;
+  std::map<std::size_t, bool> recovery_unrecoverable;
 
   std::size_t event_index = 0;
   while (event_index < events.size()) {
@@ -74,13 +82,20 @@ ClusterSimulator::Run(std::vector<GlobalArrivalEvent> events,
         natural_completion_times.try_emplace(request_id, current_time);
         continue;
       }
-      if (recovery_completion_times.count(request_id) != 0 ||
-          recovery_rejected[request_id]) {
+      if (recovery_completion_times.count(request_id) != 0) {
         continue;
       }
 
+      const DecodePlan plan = policy_.CreatePlan(tracker);
+      if (!plan.is_recoverable) {
+        recovery_unrecoverable[request_id] = true;
+        continue;
+      }
+
+      const std::chrono::microseconds service_time =
+          estimate_recovery_service_time_(plan);
       const std::optional<std::chrono::microseconds> recovery_cost =
-          recovery_queue_.GetExpectedRecoveryCost(current_time);
+          recovery_queue_.GetExpectedRecoveryCost(current_time, service_time);
       if (!recovery_cost.has_value()) {
         recovery_rejected[request_id] = true;
         continue;
@@ -92,19 +107,24 @@ ClusterSimulator::Run(std::vector<GlobalArrivalEvent> events,
         throw std::invalid_argument("Expected wait cost must not be negative");
       }
       const runtime::PolicyDecision decision =
-          policy_.Evaluate(tracker, runtime::CostEstimates{wait_cost, *recovery_cost});
+          policy_.Evaluate(plan, runtime::CostEstimates{wait_cost, *recovery_cost});
       if (decision == runtime::PolicyDecision::Recover) {
-        if (!recovery_queue_.SubmitJob(current_time)) {
+        if (!recovery_queue_.SubmitJob(current_time, service_time)) {
           recovery_rejected[request_id] = true;
           continue;
         }
         recovery_completion_times.emplace(request_id, current_time + *recovery_cost);
+      } else if (decision == runtime::PolicyDecision::Wait) {
+        recovery_waited[request_id] = true;
+      } else {
+        recovery_unrecoverable[request_id] = true;
       }
     }
   }
 
   std::map<std::size_t, RequestMetrics> metrics;
   for (const auto& [request_id, tracker] : trackers_) {
+    static_cast<void>(tracker);
     const auto natural = natural_completion_times.find(request_id);
     if (natural == natural_completion_times.end()) {
       throw std::runtime_error(
@@ -117,6 +137,8 @@ ClusterSimulator::Run(std::vector<GlobalArrivalEvent> events,
     request_metrics.recovery_admitted =
         recovery_completion_times.count(request_id) != 0;
     request_metrics.recovery_rejected = recovery_rejected[request_id];
+    request_metrics.recovery_waited = recovery_waited[request_id];
+    request_metrics.recovery_unrecoverable = recovery_unrecoverable[request_id];
     const auto recovery = recovery_completion_times.find(request_id);
     if (recovery != recovery_completion_times.end() &&
         recovery->second < natural->second) {

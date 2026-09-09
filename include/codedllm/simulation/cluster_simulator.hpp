@@ -31,11 +31,15 @@ struct RequestMetrics {
   bool recovery_won = false;
   bool recovery_admitted = false;
   bool recovery_rejected = false;
+  bool recovery_waited = false;
+  bool recovery_unrecoverable = false;
 
   [[nodiscard]] bool operator==(const RequestMetrics& other) const noexcept {
     return latency == other.latency && recovery_won == other.recovery_won &&
            recovery_admitted == other.recovery_admitted &&
-           recovery_rejected == other.recovery_rejected;
+           recovery_rejected == other.recovery_rejected &&
+           recovery_waited == other.recovery_waited &&
+           recovery_unrecoverable == other.recovery_unrecoverable;
   }
 };
 
@@ -43,9 +47,12 @@ class ClusterSimulator {
 public:
   using WaitCostOracle = std::function<std::chrono::microseconds(
       std::size_t request_id, std::chrono::microseconds current_time)>;
+  using RecoveryServiceTimeEstimator =
+      std::function<std::chrono::microseconds(const DecodePlan& plan)>;
 
   ClusterSimulator(coding::BipartiteGraph graph, coding::DecodePlanner planner,
-                   RecoveryQueue recovery_queue);
+                   RecoveryQueue recovery_queue,
+                   RecoveryServiceTimeEstimator estimate_recovery_service_time);
 
   [[nodiscard]] std::map<std::size_t, RequestMetrics>
   Run(std::vector<GlobalArrivalEvent> events,
@@ -57,6 +64,7 @@ private:
   RecoveryQueue recovery_queue_;
   std::map<std::size_t, runtime::ShardArrivalTracker> trackers_;
   const runtime::RecoveryPolicy policy_;
+  const RecoveryServiceTimeEstimator estimate_recovery_service_time_;
 };
 
 } // namespace codedllm::simulation

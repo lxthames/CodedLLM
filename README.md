@@ -56,8 +56,8 @@ CUDA execution, control-plane simulation, and a serving integration boundary:
 - randomized, bit-exact CPU/GPU differential recovery tests;
 - cost-based recovery policy and deterministic shard-arrival simulation;
 - cluster-level bounded recovery queues and KV-shaped workload generation;
-- multi-seed Wait, CodedLLM, and full-replication experiments with confidence
-  intervals;
+- multi-seed Wait, CodedLLM, capacity-normalized replication, and full-replication
+  experiments with paired confidence intervals;
 - transport and recovery-executor interfaces with cancellation and late-arrival
   handling;
 - a bounded asynchronous CUDA recovery executor with phase timing;
@@ -156,6 +156,54 @@ operations for 1 MiB and 16 MiB shards.
 On the current RTX 2080 Ti development system, large device-resident decode plans
 sustain approximately 512-527 GB/s. These are machine-specific microbenchmark
 results, not an end-to-end serving claim.
+
+## Phase 7 extensive experiment
+
+The Phase 7 experiment evaluates end-to-end completion and tail latency for four
+paired strategies on identical seeded arrival streams:
+
+- **Wait:** no added storage and no recovery.
+- **CodedLLM:** `m` parity shards for `k` systematic shards.
+- **Capacity-normalized replication:** exactly `m` additional systematic replicas,
+  matching CodedLLM's added-shard and byte budget.
+- **Full replication:** `k` additional systematic replicas, reported as an
+  unconstrained high-storage upper bound.
+
+The publishable extensive matrix covers a primary end-to-end region, queue
+robustness, and coding sensitivity. Its defaults are 30 paired seeds and 10,000
+requests per seed. It calibrates each decode-operation cost from the local
+`bench_decoder` end-to-end CUDA measurement, then runs from a clean tracked and
+untracked checkout:
+
+```bash
+bash commands/run_phase7_extensive.sh
+```
+
+For a short complete-matrix validation, override the defaults explicitly:
+
+```bash
+SEED_COUNT=2 NUM_REQUESTS=100 bash commands/run_phase7_extensive.sh
+```
+
+A successful run prints its unique artifact directory. It contains the resolved
+matrix (`manifest.txt`), host and GPU metadata, decoder and decode-plan benchmark
+JSON, the extracted `decode_costs.csv`, per-scenario and combined seed-level raw
+CSV, paired confidence summaries, and `conclusions.csv`.
+
+The primary endpoint is paired P99 completion-latency improvement versus waiting.
+A primary configuration is interval-supported only when its lower two-sided 95%
+confidence bound for that paired improvement is above zero. The report retains
+unfavorable results, including comparisons with full replication. These results
+are deterministic local simulations calibrated on the GPU that ran the experiment;
+they do not establish performance for a production RPC or cluster deployment.
+
+Development commands create smaller calibrated artifacts:
+
+```bash
+bash commands/run_phase7_pilot.sh
+bash commands/run_phase7_full.sh
+bash commands/run_phase7_load_sweep.sh
+```
 
 ## Nsight Compute profiling
 

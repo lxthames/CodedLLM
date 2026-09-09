@@ -215,6 +215,11 @@ add_test(
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_analyze_phase7.py
 )
+add_test(
+  NAME Phase7DecodeCostExtractionTest
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_extract_phase7_decode_costs.py
+)
 
 add_executable(phase7_parameter_sweep
   experiments/phase7_parameter_sweep.cpp

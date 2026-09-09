@@ -48,6 +48,9 @@ class RecoveryPolicy {
 public:
   RecoveryPolicy(coding::BipartiteGraph graph, coding::DecodePlanner planner);
 
+  [[nodiscard]] DecodePlan CreatePlan(const ShardArrivalTracker& tracker) const;
+  [[nodiscard]] PolicyDecision Evaluate(const DecodePlan& plan,
+                                        const CostEstimates& costs) const;
   [[nodiscard]] PolicyDecision Evaluate(const ShardArrivalTracker& tracker,
                                         const CostEstimates& costs) const;
 

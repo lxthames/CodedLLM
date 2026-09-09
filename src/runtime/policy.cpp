@@ -73,15 +73,11 @@ RecoveryPolicy::RecoveryPolicy(coding::BipartiteGraph graph,
   static_cast<void>(planner_.CreatePlan(graph_, {}));
 }
 
-PolicyDecision RecoveryPolicy::Evaluate(const ShardArrivalTracker& tracker,
-                                        const CostEstimates& costs) const {
+DecodePlan RecoveryPolicy::CreatePlan(const ShardArrivalTracker& tracker) const {
   if (tracker.systematic_shard_count() != graph_.systematic_shard_count ||
       tracker.parity_shard_count() != graph_.parity_shard_count) {
     throw std::invalid_argument(
         "ShardArrivalTracker dimensions do not match the recovery graph");
-  }
-  if (tracker.IsSystematicComplete()) {
-    return PolicyDecision::Wait;
   }
 
   std::unordered_set<ShardId> available_parity;
@@ -91,15 +87,25 @@ PolicyDecision RecoveryPolicy::Evaluate(const ShardArrivalTracker& tracker,
       available_parity.insert(parity);
     }
   }
-  const DecodePlan plan =
-      planner_.CreatePlan(graph_, tracker.GetMissingSystematic(), available_parity);
+  return planner_.CreatePlan(graph_, tracker.GetMissingSystematic(), available_parity);
+}
+
+PolicyDecision RecoveryPolicy::Evaluate(const DecodePlan& plan,
+                                        const CostEstimates& costs) const {
   if (!plan.is_recoverable) {
     return PolicyDecision::Unrecoverable;
   }
-
   return costs.expected_recovery_cost < costs.expected_wait_remaining
              ? PolicyDecision::Recover
              : PolicyDecision::Wait;
+}
+
+PolicyDecision RecoveryPolicy::Evaluate(const ShardArrivalTracker& tracker,
+                                        const CostEstimates& costs) const {
+  if (tracker.IsSystematicComplete()) {
+    return PolicyDecision::Wait;
+  }
+  return Evaluate(CreatePlan(tracker), costs);
 }
 
 } // namespace codedllm::runtime

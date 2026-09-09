@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Phase 7 seed runs and calculate deterministic 95% intervals."""
+"""Aggregate paired Phase 7 experiments and report confidence-bound conclusions."""
 
 import argparse
 import csv
@@ -9,7 +9,8 @@ import sys
 from collections import defaultdict
 
 
-CONFIG_FIELDS = (
+SCENARIO_FIELDS = (
+    "scenario",
     "num_requests",
     "arrival_rate_hz",
     "k",
@@ -19,16 +20,25 @@ CONFIG_FIELDS = (
     "straggler_probability",
     "queue_depth",
     "gpu_concurrency",
-    "strategy",
+    "decode_cost_model",
 )
-PAIR_FIELDS = CONFIG_FIELDS[:-1]
+BUDGET_FIELDS = ("added_shard_count", "storage_overhead_pct")
+CONFIG_FIELDS = (*SCENARIO_FIELDS, "strategy", *BUDGET_FIELDS)
+PAIR_FIELDS = SCENARIO_FIELDS
 METRIC_FIELDS = (
     "p50_us",
     "p95_us",
     "p99_us",
     "recovery_admission_pct",
     "recovery_rejection_pct",
+    "recovery_wait_pct",
+    "recovery_unrecoverable_pct",
     "recovery_win_pct",
+)
+BASELINES = (
+    "wait",
+    "replication_capacity_normalized",
+    "replication_full",
 )
 T_CRITICAL_95 = (
     0.0,
@@ -85,8 +95,43 @@ def _config_key(row, fields):
     return tuple(row[field] for field in fields)
 
 
-def _paired_gain(coded_rows, raw_index, baseline_strategy):
-    gains = []
+def _float(row, field):
+    try:
+        value = float(row[field])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid {field}") from error
+    if not math.isfinite(value):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _validate_budget(row):
+    strategy = row["strategy"]
+    k = _float(row, "k")
+    m = _float(row, "m")
+    added = _float(row, "added_shard_count")
+    overhead = _float(row, "storage_overhead_pct")
+    if k <= 0.0 or m <= 0.0 or added < 0.0 or overhead < 0.0:
+        raise ValueError("invalid storage budget")
+    if not row["decode_cost_model"]:
+        raise ValueError("missing decode cost model")
+    expected_overhead = 100.0 * added / k
+    if not math.isclose(overhead, expected_overhead, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError("storage overhead does not match added shard count")
+    if strategy == "wait" and (added != 0.0 or overhead != 0.0):
+        raise ValueError("wait baseline must not add storage")
+    if strategy in ("codedllm", "replication_capacity_normalized"):
+        if not math.isclose(added, m, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError("capacity-normalized storage must add m shards")
+    if strategy == "replication_full" and not math.isclose(
+        added, k, rel_tol=0.0, abs_tol=1e-6
+    ):
+        raise ValueError("full replication must add k shards")
+
+
+def _paired_improvement(coded_rows, raw_index, baseline_strategy):
+    absolute_deltas = []
+    percentage_gains = []
     wins = 0
     for coded in coded_rows:
         key = (coded["seed"], _config_key(coded, PAIR_FIELDS), baseline_strategy)
@@ -95,14 +140,30 @@ def _paired_gain(coded_rows, raw_index, baseline_strategy):
             raise ValueError(
                 f"missing {baseline_strategy} pair for seed {coded['seed']}"
             )
-        baseline_p99 = float(baseline["p99_us"])
-        coded_p99 = float(coded["p99_us"])
+        if baseline_strategy == "replication_capacity_normalized":
+            for field in BUDGET_FIELDS:
+                if not math.isclose(
+                    _float(coded, field), _float(baseline, field),
+                    rel_tol=0.0, abs_tol=1e-6
+                ):
+                    raise ValueError("capacity-normalized storage budget mismatch")
+        baseline_p99 = _float(baseline, "p99_us")
+        coded_p99 = _float(coded, "p99_us")
         if baseline_p99 <= 0.0:
             raise ValueError("baseline P99 must be positive")
-        gains.append(100.0 * (baseline_p99 - coded_p99) / baseline_p99)
+        delta = baseline_p99 - coded_p99
+        absolute_deltas.append(delta)
+        percentage_gains.append(100.0 * delta / baseline_p99)
         wins += coded_p99 < baseline_p99
-    mean, ci95 = _mean_and_ci95(gains)
-    return mean, ci95, 100.0 * wins / len(gains)
+    absolute_mean, absolute_ci95 = _mean_and_ci95(absolute_deltas)
+    percentage_mean, percentage_ci95 = _mean_and_ci95(percentage_gains)
+    return (
+        absolute_mean,
+        absolute_ci95,
+        percentage_mean,
+        percentage_ci95,
+        100.0 * wins / len(absolute_deltas),
+    )
 
 
 def analyze_rows(rows):
@@ -111,17 +172,21 @@ def analyze_rows(rows):
         raise ValueError("Phase 7 input contains no rows")
 
     required = {"seed", *CONFIG_FIELDS, *METRIC_FIELDS}
-    missing = required.difference(rows[0])
-    if missing:
-        raise ValueError(f"missing CSV columns: {', '.join(sorted(missing))}")
+    for row in rows:
+        missing = required.difference(row)
+        if missing:
+            raise ValueError(f"missing CSV columns: {', '.join(sorted(missing))}")
+        _validate_budget(row)
 
     groups = defaultdict(list)
     raw_index = {}
     for row in rows:
-        groups[_config_key(row, CONFIG_FIELDS)].append(row)
-        raw_index[
-            (row["seed"], _config_key(row, PAIR_FIELDS), row["strategy"])
-        ] = row
+        group_key = _config_key(row, CONFIG_FIELDS)
+        groups[group_key].append(row)
+        pair_key = (row["seed"], _config_key(row, PAIR_FIELDS), row["strategy"])
+        if pair_key in raw_index:
+            raise ValueError("duplicate seed within one experiment configuration")
+        raw_index[pair_key] = row
 
     summary = []
     for key in sorted(groups):
@@ -133,61 +198,127 @@ def analyze_rows(rows):
         result = dict(zip(CONFIG_FIELDS, key))
         result["seed_count"] = len(seeds)
         for metric in METRIC_FIELDS:
-            mean, ci95 = _mean_and_ci95(
-                [float(row[metric]) for row in group_rows]
-            )
+            mean, ci95 = _mean_and_ci95([_float(row, metric) for row in group_rows])
             output_name = metric.removesuffix("_us").removesuffix("_pct")
             unit = "_us" if metric.endswith("_us") else "_pct"
             result[f"{output_name}_mean{unit}"] = mean
             result[f"{output_name}_ci95{unit}"] = ci95
 
         if result["strategy"] == "codedllm":
-            for baseline in ("wait", "replication"):
-                mean, ci95, win_percent = _paired_gain(
-                    group_rows, raw_index, baseline
-                )
-                result[f"p99_gain_vs_{baseline}_mean_pct"] = mean
-                result[f"p99_gain_vs_{baseline}_ci95_pct"] = ci95
+            for baseline in BASELINES:
+                (
+                    absolute_mean,
+                    absolute_ci95,
+                    percentage_mean,
+                    percentage_ci95,
+                    win_percent,
+                ) = _paired_improvement(group_rows, raw_index, baseline)
+                result[f"p99_delta_vs_{baseline}_mean_us"] = absolute_mean
+                result[f"p99_delta_vs_{baseline}_ci95_us"] = absolute_ci95
+                result[f"p99_gain_vs_{baseline}_mean_pct"] = percentage_mean
+                result[f"p99_gain_vs_{baseline}_ci95_pct"] = percentage_ci95
                 result[f"p99_win_vs_{baseline}_seed_pct"] = win_percent
         summary.append(result)
     return summary
 
 
-OUTPUT_FIELDS = (
-    *CONFIG_FIELDS,
+METRIC_OUTPUT_FIELDS = tuple(
+    field
+    for metric in METRIC_FIELDS
+    for field in (
+        f"{metric.removesuffix('_us').removesuffix('_pct')}_mean"
+        + ("_us" if metric.endswith("_us") else "_pct"),
+        f"{metric.removesuffix('_us').removesuffix('_pct')}_ci95"
+        + ("_us" if metric.endswith("_us") else "_pct"),
+    )
+)
+COMPARISON_OUTPUT_FIELDS = tuple(
+    field
+    for baseline in BASELINES
+    for field in (
+        f"p99_delta_vs_{baseline}_mean_us",
+        f"p99_delta_vs_{baseline}_ci95_us",
+        f"p99_gain_vs_{baseline}_mean_pct",
+        f"p99_gain_vs_{baseline}_ci95_pct",
+        f"p99_win_vs_{baseline}_seed_pct",
+    )
+)
+OUTPUT_FIELDS = (*CONFIG_FIELDS, "seed_count", *METRIC_OUTPUT_FIELDS, *COMPARISON_OUTPUT_FIELDS)
+CONCLUSION_FIELDS = (
+    *SCENARIO_FIELDS,
     "seed_count",
-    "p50_mean_us",
-    "p50_ci95_us",
-    "p95_mean_us",
-    "p95_ci95_us",
-    "p99_mean_us",
-    "p99_ci95_us",
-    "recovery_admission_mean_pct",
-    "recovery_admission_ci95_pct",
-    "recovery_rejection_mean_pct",
-    "recovery_rejection_ci95_pct",
-    "recovery_win_mean_pct",
-    "recovery_win_ci95_pct",
-    "p99_gain_vs_wait_mean_pct",
-    "p99_gain_vs_wait_ci95_pct",
-    "p99_win_vs_wait_seed_pct",
-    "p99_gain_vs_replication_mean_pct",
-    "p99_gain_vs_replication_ci95_pct",
-    "p99_win_vs_replication_seed_pct",
+    "is_primary_scenario",
+    "wait_p99_delta_mean_us",
+    "wait_p99_delta_ci95_us",
+    "wait_p99_interval_supported",
+    "capacity_replication_p99_delta_mean_us",
+    "capacity_replication_p99_delta_ci95_us",
+    "capacity_replication_interval_supported",
+    "full_replication_p99_delta_mean_us",
+    "full_replication_p99_delta_ci95_us",
+    "full_replication_interval_supported",
+    "conclusion_scope",
 )
 
 
-def _format_output(row):
+def _interval_supported(row, baseline):
+    return (
+        row[f"p99_delta_vs_{baseline}_mean_us"]
+        - row[f"p99_delta_vs_{baseline}_ci95_us"]
+        > 0.0
+    )
+
+
+def build_conclusions(summary):
+    conclusions = []
+    for row in summary:
+        if row["strategy"] != "codedllm":
+            continue
+        result = {field: row[field] for field in SCENARIO_FIELDS}
+        result["seed_count"] = row["seed_count"]
+        result["is_primary_scenario"] = row["scenario"] == "primary"
+        for prefix, baseline in (
+            ("wait", "wait"),
+            ("capacity_replication", "replication_capacity_normalized"),
+            ("full_replication", "replication_full"),
+        ):
+            result[f"{prefix}_p99_delta_mean_us"] = row[
+                f"p99_delta_vs_{baseline}_mean_us"
+            ]
+            result[f"{prefix}_p99_delta_ci95_us"] = row[
+                f"p99_delta_vs_{baseline}_ci95_us"
+            ]
+            result[f"{prefix}_p99_interval_supported"] = _interval_supported(
+                row, baseline
+            )
+        result["conclusion_scope"] = (
+            "primary_interval_supported"
+            if result["is_primary_scenario"]
+            and result["wait_p99_interval_supported"]
+            else "exploratory" if not result["is_primary_scenario"] else "not_supported"
+        )
+        conclusions.append(result)
+    return conclusions
+
+
+def _format_output(row, fields):
     return {
         field: f"{row[field]:.6f}" if isinstance(row.get(field), float) else row.get(field, "")
-        for field in OUTPUT_FIELDS
+        for field in fields
     }
+
+
+def write_csv(destination, fields, rows):
+    writer = csv.DictWriter(destination, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(_format_output(row, fields) for row in rows)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="raw multi-seed Phase 7 CSV")
     parser.add_argument("-o", "--output", help="summary CSV; defaults to stdout")
+    parser.add_argument("--conclusions", help="paired P99 conclusion CSV")
     args = parser.parse_args()
 
     with open(args.input, newline="", encoding="utf-8") as source:
@@ -199,12 +330,14 @@ def main():
         else sys.stdout
     )
     try:
-        writer = csv.DictWriter(destination, fieldnames=OUTPUT_FIELDS)
-        writer.writeheader()
-        writer.writerows(_format_output(row) for row in summary)
+        write_csv(destination, OUTPUT_FIELDS, summary)
     finally:
         if args.output:
             destination.close()
+
+    if args.conclusions:
+        with open(args.conclusions, "w", newline="", encoding="utf-8") as destination:
+            write_csv(destination, CONCLUSION_FIELDS, build_conclusions(summary))
 
 
 if __name__ == "__main__":

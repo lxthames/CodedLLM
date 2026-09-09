@@ -18,6 +18,9 @@ mkdir -p "${artifacts_dir}"
 run_dir="$(mktemp -d "${artifacts_dir}/phase7-full-${timestamp}-XXXXXX")"
 
 BUILD_DIR="${build_dir}" bash "${repo_root}/commands/build.sh"
+"${build_dir}/bench_decoder" --benchmark_format=json > "${run_dir}/bench_decoder.json"
+python3 "${repo_root}/scripts/extract_phase7_decode_costs.py" \
+  "${run_dir}/bench_decoder.json" -o "${run_dir}/decode_costs.csv"
 
 {
   printf 'timestamp_utc=%s\n' "${timestamp}"
@@ -33,9 +36,11 @@ BUILD_DIR="${build_dir}" bash "${repo_root}/commands/build.sh"
   --base-seed "${base_seed}" \
   --seed-count "${seed_count}" \
   --num-requests "${num_requests}" \
+  --calibration-csv "${run_dir}/decode_costs.csv" \
   > "${run_dir}/phase7_raw.csv"
 python3 "${repo_root}/scripts/analyze_phase7.py" \
   "${run_dir}/phase7_raw.csv" \
-  -o "${run_dir}/phase7_summary.csv"
+  -o "${run_dir}/phase7_summary.csv" \
+  --conclusions "${run_dir}/conclusions.csv"
 
 printf 'Full Phase 7 results: %s\n' "${run_dir}"

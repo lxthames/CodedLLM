@@ -33,8 +33,18 @@ private:
   const std::size_t parity_shard_count_;
 };
 
+[[nodiscard]] std::vector<ShardId> SelectCapacityNormalizedReplicas(
+    std::size_t request_id, std::size_t systematic_shard_count,
+    std::size_t replica_count, std::uint32_t replication_seed);
+
 [[nodiscard]] std::vector<GlobalArrivalEvent>
 ApplyReplication(const std::vector<GlobalArrivalEvent>& events,
-                 const WorkloadConfig& config, std::uint32_t replication_seed);
+                 const WorkloadConfig& config, std::size_t systematic_shard_count,
+                 std::uint32_t replication_seed);
+
+[[nodiscard]] std::vector<GlobalArrivalEvent> ApplyCapacityNormalizedReplication(
+    const std::vector<GlobalArrivalEvent>& events, const WorkloadConfig& config,
+    std::size_t systematic_shard_count, std::size_t replica_count,
+    std::uint32_t replication_seed);
 
 } // namespace codedllm::simulation

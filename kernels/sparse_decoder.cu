@@ -20,6 +20,46 @@ cuda_unique_ptr<T> AllocateDeviceBuffer(std::size_t element_count) {
   return cuda_unique_ptr<T>(device_buffer);
 }
 
+class CudaEvent {
+ public:
+  CudaEvent() = default;
+  ~CudaEvent() {
+    if (event_ != nullptr) {
+      cudaEventDestroy(event_);
+    }
+  }
+
+  CudaEvent(CudaEvent&& other) noexcept
+      : event_(std::exchange(other.event_, nullptr)) {}
+  CudaEvent& operator=(CudaEvent&& other) noexcept {
+    if (this != &other) {
+      if (event_ != nullptr) {
+        cudaEventDestroy(event_);
+      }
+      event_ = std::exchange(other.event_, nullptr);
+    }
+    return *this;
+  }
+
+  CudaEvent(const CudaEvent&) = delete;
+  CudaEvent& operator=(const CudaEvent&) = delete;
+
+  void Create() {
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreate(&event));
+    event_ = event;
+  }
+
+  void Record(cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(event_, stream));
+  }
+
+  [[nodiscard]] cudaEvent_t get() const { return event_; }
+
+ private:
+  cudaEvent_t event_ = nullptr;
+};
+
 std::size_t CalculateGridBlocks(
     std::size_t word_count, std::size_t words_per_thread,
     const codedllm::kernels::DeviceTuningConfig& config) {
@@ -420,6 +460,261 @@ void download_decode_results_cuda(DeviceDecodeContext& context,
     shards.at(impl.plan.operations.at(operation_index).output) =
         std::move(outputs.at(operation_index));
   }
+}
+
+struct DeviceShardStagingContext::Impl {
+  struct StagedTransfer {
+    CudaEvent start;
+    CudaEvent stop;
+  };
+
+  std::vector<std::optional<std::size_t>> word_counts;
+  std::vector<std::optional<coding::WordShard>> staged_shards;
+  std::vector<cuda_unique_ptr<std::uint32_t>> device_shards;
+  std::vector<StagedTransfer> staged_transfers;
+  DecodePlan plan;
+  std::vector<std::size_t> source_offsets;
+  cuda_unique_ptr<std::uint32_t*> device_shard_table;
+  cuda_unique_ptr<ShardId> device_source_ids;
+  cudaStream_t stream = nullptr;
+  int device_id = 0;
+  bool finalized = false;
+
+  ~Impl() {
+    cudaSetDevice(device_id);
+    if (stream != nullptr) {
+      cudaStreamSynchronize(stream);
+      cudaStreamDestroy(stream);
+    }
+  }
+};
+
+DeviceShardStagingContext::DeviceShardStagingContext()
+    : impl_(std::make_unique<Impl>()) {}
+DeviceShardStagingContext::~DeviceShardStagingContext() = default;
+DeviceShardStagingContext::DeviceShardStagingContext(
+    DeviceShardStagingContext&&) noexcept = default;
+DeviceShardStagingContext& DeviceShardStagingContext::operator=(
+    DeviceShardStagingContext&&) noexcept = default;
+
+std::unique_ptr<DeviceShardStagingContext>
+create_device_shard_staging_context_cuda(std::size_t shard_count) {
+  if (shard_count == 0) {
+    throw std::invalid_argument("Staged decode context requires shard slots");
+  }
+
+  std::unique_ptr<DeviceShardStagingContext> context(
+      new DeviceShardStagingContext());
+  DeviceShardStagingContext::Impl& impl = *context->impl_;
+  impl.word_counts.resize(shard_count);
+  impl.staged_shards.resize(shard_count);
+  impl.device_shards.resize(shard_count);
+  CUDA_CHECK(cudaGetDevice(&impl.device_id));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&impl.stream, cudaStreamNonBlocking));
+  return context;
+}
+
+void stage_decode_shard_cuda(DeviceShardStagingContext& context,
+                             ShardId shard_id,
+                             const coding::WordShard& shard) {
+  DeviceShardStagingContext::Impl& impl = *context.impl_;
+  if (impl.finalized) {
+    throw std::logic_error("Cannot stage shards after decode plan finalization");
+  }
+  if (shard_id >= impl.device_shards.size()) {
+    throw std::invalid_argument("Staged shard ID is out of bounds");
+  }
+  if (shard.empty()) {
+    throw std::invalid_argument("Staged shards must not be empty");
+  }
+  if (impl.device_shards.at(shard_id) != nullptr) {
+    throw std::invalid_argument("Staged shard is already present");
+  }
+
+  CUDA_CHECK(cudaSetDevice(impl.device_id));
+  impl.staged_shards.at(shard_id) = shard;
+  impl.word_counts.at(shard_id) = shard.size();
+  impl.device_shards.at(shard_id) =
+      AllocateDeviceBuffer<std::uint32_t>(shard.size());
+
+  DeviceShardStagingContext::Impl::StagedTransfer transfer;
+  transfer.start.Create();
+  transfer.stop.Create();
+  transfer.start.Record(impl.stream);
+  CUDA_CHECK(cudaMemcpyAsync(impl.device_shards.at(shard_id).get(),
+                             impl.staged_shards.at(shard_id)->data(),
+                             shard.size() * sizeof(std::uint32_t),
+                             cudaMemcpyHostToDevice, impl.stream));
+  transfer.stop.Record(impl.stream);
+  impl.staged_transfers.push_back(std::move(transfer));
+}
+
+void synchronize_staged_shard_uploads_cuda(DeviceShardStagingContext& context) {
+  DeviceShardStagingContext::Impl& impl = *context.impl_;
+  CUDA_CHECK(cudaSetDevice(impl.device_id));
+  CUDA_CHECK(cudaStreamSynchronize(impl.stream));
+}
+
+void run_staged_decode_plan_cuda(DeviceShardStagingContext& context,
+                                 const DecodePlan& plan,
+                                 coding::ShardSlots& shards,
+                                 CudaDecodeTimings& timings) {
+  DeviceShardStagingContext::Impl& impl = *context.impl_;
+  if (impl.finalized) {
+    throw std::logic_error("Staged decode context has already executed a plan");
+  }
+  if (shards.size() != impl.device_shards.size()) {
+    throw std::invalid_argument(
+        "Destination shard slots must match the staged context");
+  }
+  ValidatePlanShape(plan);
+  CUDA_CHECK(cudaSetDevice(impl.device_id));
+
+  for (std::size_t shard_id = 0; shard_id < impl.device_shards.size();
+       ++shard_id) {
+    if (impl.staged_shards.at(shard_id) != shards.at(shard_id)) {
+      throw std::invalid_argument(
+          "Staged shards must match the supplied host shard slots");
+    }
+  }
+
+  std::vector<std::optional<std::size_t>> finalized_word_counts =
+      impl.word_counts;
+  std::vector<bool> required_shards(impl.device_shards.size(), false);
+  std::vector<bool> available_shards(impl.device_shards.size(), false);
+  for (std::size_t shard_id = 0; shard_id < impl.device_shards.size();
+       ++shard_id) {
+    available_shards.at(shard_id) =
+        finalized_word_counts.at(shard_id).has_value();
+  }
+
+  std::vector<ShardId> flattened_sources;
+  std::vector<std::size_t> source_offsets;
+  source_offsets.reserve(plan.operations.size());
+  for (const XorOperation& operation : plan.operations) {
+    if (operation.output >= impl.device_shards.size()) {
+      throw std::invalid_argument("DecodePlan output shard is out of bounds");
+    }
+    if (operation.sources.empty()) {
+      throw std::invalid_argument("DecodePlan XOR operation has no sources");
+    }
+    if (available_shards.at(operation.output)) {
+      throw std::invalid_argument("DecodePlan output shard is already present");
+    }
+
+    source_offsets.push_back(flattened_sources.size());
+    std::optional<std::size_t> operation_word_count;
+    for (const ShardId source : operation.sources) {
+      if (source >= impl.device_shards.size() ||
+          !available_shards.at(source) ||
+          !finalized_word_counts.at(source).has_value()) {
+        throw std::invalid_argument("DecodePlan source shard is unavailable");
+      }
+      if (!operation_word_count.has_value()) {
+        operation_word_count = finalized_word_counts.at(source);
+      } else if (operation_word_count != finalized_word_counts.at(source)) {
+        throw std::invalid_argument(
+            "DecodePlan sources must be available and equally sized");
+      }
+      required_shards.at(source) = true;
+      flattened_sources.push_back(source);
+    }
+
+    finalized_word_counts.at(operation.output) = operation_word_count;
+    available_shards.at(operation.output) = true;
+    required_shards.at(operation.output) = true;
+  }
+
+  std::vector<std::uint32_t*> host_shard_table(impl.device_shards.size(),
+                                                nullptr);
+  for (std::size_t shard_id = 0; shard_id < impl.device_shards.size();
+       ++shard_id) {
+    if (!required_shards.at(shard_id)) {
+      continue;
+    }
+    if (impl.device_shards.at(shard_id) == nullptr) {
+      impl.device_shards.at(shard_id) = AllocateDeviceBuffer<std::uint32_t>(
+          *finalized_word_counts.at(shard_id));
+    }
+    host_shard_table.at(shard_id) = impl.device_shards.at(shard_id).get();
+  }
+
+  if (!plan.operations.empty()) {
+    impl.device_shard_table =
+        AllocateDeviceBuffer<std::uint32_t*>(host_shard_table.size());
+    CUDA_CHECK(cudaMemcpyAsync(
+        impl.device_shard_table.get(), host_shard_table.data(),
+        host_shard_table.size() * sizeof(std::uint32_t*), cudaMemcpyHostToDevice,
+        impl.stream));
+    impl.device_source_ids =
+        AllocateDeviceBuffer<ShardId>(flattened_sources.size());
+    CUDA_CHECK(cudaMemcpyAsync(impl.device_source_ids.get(),
+                               flattened_sources.data(),
+                               flattened_sources.size() * sizeof(ShardId),
+                               cudaMemcpyHostToDevice, impl.stream));
+  }
+
+  impl.word_counts = std::move(finalized_word_counts);
+  impl.plan = plan;
+  impl.source_offsets = std::move(source_offsets);
+  impl.finalized = true;
+
+  CudaEvent kernel_start;
+  CudaEvent kernel_stop;
+  CudaEvent d2h_start;
+  CudaEvent d2h_stop;
+  kernel_start.Create();
+  kernel_stop.Create();
+  d2h_start.Create();
+  d2h_stop.Create();
+
+  kernel_start.Record(impl.stream);
+  for (std::size_t operation_index = 0;
+       operation_index < impl.plan.operations.size(); ++operation_index) {
+    const XorOperation& operation = impl.plan.operations.at(operation_index);
+    LaunchXorOperationCuda(
+        operation, *impl.word_counts.at(operation.output),
+        impl.device_shard_table.get(),
+        impl.device_source_ids.get() + impl.source_offsets.at(operation_index),
+        impl.device_shards.at(operation.output).get(), impl.device_id,
+        impl.stream);
+  }
+  kernel_stop.Record(impl.stream);
+
+  std::vector<coding::WordShard> outputs;
+  outputs.reserve(impl.plan.operations.size());
+  d2h_start.Record(impl.stream);
+  for (const XorOperation& operation : impl.plan.operations) {
+    const std::size_t word_count = *impl.word_counts.at(operation.output);
+    outputs.emplace_back(word_count);
+    CUDA_CHECK(cudaMemcpyAsync(outputs.back().data(),
+                               impl.device_shards.at(operation.output).get(),
+                               word_count * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, impl.stream));
+  }
+  d2h_stop.Record(impl.stream);
+  CUDA_CHECK(cudaStreamSynchronize(impl.stream));
+
+  timings = {};
+  for (const DeviceShardStagingContext::Impl::StagedTransfer& transfer :
+       impl.staged_transfers) {
+    float elapsed_ms = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, transfer.start.get(),
+                                    transfer.stop.get()));
+    timings.h2d_ms += elapsed_ms;
+  }
+  impl.staged_transfers.clear();
+  CUDA_CHECK(cudaEventElapsedTime(&timings.kernel_ms, kernel_start.get(),
+                                  kernel_stop.get()));
+  CUDA_CHECK(cudaEventElapsedTime(&timings.d2h_ms, d2h_start.get(),
+                                  d2h_stop.get()));
+
+  for (std::size_t operation_index = 0;
+       operation_index < impl.plan.operations.size(); ++operation_index) {
+    shards.at(impl.plan.operations.at(operation_index).output) =
+        std::move(outputs.at(operation_index));
+  }
+  impl.staged_shards.clear();
 }
 
 void run_sparse_decode_cuda(const std::uint32_t* shard_a,

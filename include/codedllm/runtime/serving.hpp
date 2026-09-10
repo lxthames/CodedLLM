@@ -40,6 +40,14 @@ public:
   virtual ~RecoveryExecutor() = default;
   [[nodiscard]] virtual std::optional<std::chrono::microseconds>
   EstimateRecoveryCost() const = 0;
+  virtual void StageShard(RequestId request_id, std::size_t shard_count,
+                          ShardId shard_id,
+                          const coding::WordShard& payload) {
+    static_cast<void>(request_id);
+    static_cast<void>(shard_count);
+    static_cast<void>(shard_id);
+    static_cast<void>(payload);
+  }
   virtual bool Submit(RequestId request_id, DecodePlan plan, coding::ShardSlots shards,
                       CompletionHandler completion) = 0;
   virtual bool Cancel(RequestId request_id) = 0;

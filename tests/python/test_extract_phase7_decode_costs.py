@@ -24,9 +24,9 @@ class Phase7DecodeCostExtractionTest(unittest.TestCase):
         required = {(2, 1), (8, 16)}
         document = {
             "benchmarks": [
-                benchmark("EndToEndLatency/2/1048576", 1001.1, "ns"),
-                benchmark("EndToEndLatency/8/16777216", 1.001, "ms"),
-                benchmark("EndToEndLatency/2/1048580", 99.0, "us"),
+                benchmark("StagedReadyToResultLatency/2/1048576", 1001.1, "ns"),
+                benchmark("StagedReadyToResultLatency/8/16777216", 1.001, "ms"),
+                benchmark("StagedReadyToResultLatency/2/1048580", 99.0, "us"),
                 benchmark("KernelOnlyLatency/2/1048576", 1.0, "ns"),
             ]
         }
@@ -46,8 +46,8 @@ class Phase7DecodeCostExtractionTest(unittest.TestCase):
             EXTRACTOR.extract_costs(
                 {
                     "benchmarks": [
-                        benchmark("EndToEndLatency/2/1048576"),
-                        benchmark("suite/EndToEndLatency/2/1048576"),
+                        benchmark("StagedReadyToResultLatency/2/1048576"),
+                        benchmark("suite/StagedReadyToResultLatency/2/1048576"),
                     ]
                 },
                 required,
@@ -58,7 +58,7 @@ class Phase7DecodeCostExtractionTest(unittest.TestCase):
                 {
                     "benchmarks": [
                         benchmark(
-                            "EndToEndLatency/2/1048576",
+                            "StagedReadyToResultLatency/2/1048576",
                             error_occurred=True,
                         )
                     ]

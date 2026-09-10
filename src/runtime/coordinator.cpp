@@ -126,11 +126,12 @@ struct RecoveryCoordinator::Impl
         return;
       }
 
+      executor->StageShard(request_id, state->shards.size(), shard_id, payload);
       state->shards.at(shard_id) = std::move(payload);
       state->tracker.MarkArrived(shard_id, arrival_time);
       if (state->tracker.IsSystematicComplete()) {
         state->snapshot.status = RequestStatus::NaturalComplete;
-        should_cancel = state->snapshot.recovery_submitted;
+        should_cancel = true;
         condition.notify_all();
       } else if (!state->recovery_closed && !state->snapshot.recovery_submitted) {
         std::unordered_set<ShardId> available_parity;
@@ -183,13 +184,24 @@ struct RecoveryCoordinator::Impl
                              impl->OnRecoveryComplete(request_id, std::move(result));
                            }
                          });
-    if (!accepted) {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (!IsTerminal(state->snapshot.status)) {
-        state->snapshot.recovery_submitted = false;
-        state->snapshot.recovery_rejected = true;
-        state->recovery_closed = true;
+    if (accepted) {
+      bool completed_naturally = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        completed_naturally =
+            state->snapshot.status == RequestStatus::NaturalComplete;
       }
+      if (completed_naturally) {
+        executor->Cancel(request_id);
+      }
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!IsTerminal(state->snapshot.status)) {
+      state->snapshot.recovery_submitted = false;
+      state->snapshot.recovery_rejected = true;
+      state->recovery_closed = true;
     }
   }
 

@@ -40,6 +40,33 @@ class DeviceDecodeContext {
                                            coding::ShardSlots&);
 };
 
+class DeviceShardStagingContext {
+ public:
+  ~DeviceShardStagingContext();
+  DeviceShardStagingContext(DeviceShardStagingContext&&) noexcept;
+  DeviceShardStagingContext& operator=(DeviceShardStagingContext&&) noexcept;
+
+  DeviceShardStagingContext(const DeviceShardStagingContext&) = delete;
+  DeviceShardStagingContext& operator=(const DeviceShardStagingContext&) = delete;
+
+ private:
+  DeviceShardStagingContext();
+
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+
+  friend std::unique_ptr<DeviceShardStagingContext>
+  create_device_shard_staging_context_cuda(std::size_t);
+  friend void stage_decode_shard_cuda(DeviceShardStagingContext&, ShardId,
+                                      const coding::WordShard&);
+  friend void synchronize_staged_shard_uploads_cuda(
+      DeviceShardStagingContext&);
+  friend void run_staged_decode_plan_cuda(DeviceShardStagingContext&,
+                                          const DecodePlan&,
+                                          coding::ShardSlots&,
+                                          CudaDecodeTimings&);
+};
+
 // CPU reference implementation for the dummy shard reconstruction operation.
 void run_sparse_decode_cpu(const std::uint32_t* shard_a,
                            const std::uint32_t* shard_b,
@@ -70,5 +97,15 @@ void launch_decode_plan_cuda(DeviceDecodeContext& context);
 void synchronize_decode_plan_cuda(DeviceDecodeContext& context);
 void download_decode_results_cuda(DeviceDecodeContext& context,
                                   coding::ShardSlots& shards);
+
+[[nodiscard]] std::unique_ptr<DeviceShardStagingContext>
+create_device_shard_staging_context_cuda(std::size_t shard_count);
+void stage_decode_shard_cuda(DeviceShardStagingContext& context, ShardId shard_id,
+                             const coding::WordShard& shard);
+void synchronize_staged_shard_uploads_cuda(DeviceShardStagingContext& context);
+void run_staged_decode_plan_cuda(DeviceShardStagingContext& context,
+                                 const DecodePlan& plan,
+                                 coding::ShardSlots& shards,
+                                 CudaDecodeTimings& timings);
 
 }  // namespace codedllm

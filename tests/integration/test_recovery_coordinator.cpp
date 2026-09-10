@@ -10,6 +10,7 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace codedllm::runtime {
 namespace {
@@ -59,11 +60,24 @@ public:
     CompletionHandler completion;
   };
 
+  struct StagedShard {
+    RequestId request_id;
+    std::size_t shard_count;
+    ShardId shard_id;
+    coding::WordShard payload;
+  };
+
   explicit FakeExecutor(std::optional<std::chrono::microseconds> estimated_cost = 2ms)
       : estimated_cost_(estimated_cost) {}
 
   std::optional<std::chrono::microseconds> EstimateRecoveryCost() const override {
     return estimated_cost_;
+  }
+
+  void StageShard(RequestId request_id, std::size_t shard_count, ShardId shard_id,
+                  const coding::WordShard& payload) override {
+    staged_shards_.push_back(
+        StagedShard{request_id, shard_count, shard_id, payload});
   }
 
   bool Submit(RequestId request_id, DecodePlan plan, coding::ShardSlots shards,
@@ -75,6 +89,7 @@ public:
   }
 
   bool Cancel(RequestId request_id) override {
+    ++cancel_calls_;
     cancelled_ = tasks_.erase(request_id) != 0;
     return cancelled_;
   }
@@ -97,10 +112,16 @@ public:
   }
 
   [[nodiscard]] bool cancelled() const { return cancelled_; }
+  [[nodiscard]] const std::vector<StagedShard>& staged_shards() const {
+    return staged_shards_;
+  }
+  [[nodiscard]] std::size_t cancel_calls() const { return cancel_calls_; }
 
 private:
   std::optional<std::chrono::microseconds> estimated_cost_;
   std::unordered_map<RequestId, Task> tasks_;
+  std::vector<StagedShard> staged_shards_;
+  std::size_t cancel_calls_ = 0;
   bool cancelled_ = false;
 };
 
@@ -124,6 +145,10 @@ TEST(RecoveryCoordinatorTest, RecoversThroughInjectedExecutor) {
   transport.Emit(7, 2, parity, now + 1ms);
 
   EXPECT_TRUE(executor->HasTask(7));
+  ASSERT_EQ(executor->staged_shards().size(), 2U);
+  EXPECT_EQ(executor->staged_shards().at(0).shard_id, 0U);
+  EXPECT_EQ(executor->staged_shards().at(1).shard_id, 2U);
+  EXPECT_EQ(executor->staged_shards().at(0).shard_count, 3U);
   EXPECT_TRUE(coordinator.GetSnapshot(7).recovery_submitted);
   executor->Complete(7);
 
@@ -147,6 +172,8 @@ TEST(RecoveryCoordinatorTest, CompletesNaturallyWithoutRecovery) {
 
   EXPECT_EQ(coordinator.GetSnapshot(8).status, RequestStatus::NaturalComplete);
   EXPECT_FALSE(coordinator.GetSnapshot(8).recovery_submitted);
+  EXPECT_EQ(executor->staged_shards().size(), 2U);
+  EXPECT_EQ(executor->cancel_calls(), 1U);
 }
 
 TEST(RecoveryCoordinatorTest, NaturalCompletionCancelsQueuedRecovery) {

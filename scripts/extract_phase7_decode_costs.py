@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Extract required end-to-end CUDA decode costs from Google Benchmark JSON."""
+"""Extract required staged ready-to-result CUDA decode costs from Google
+Benchmark JSON."""
 
 import argparse
 import csv
@@ -9,7 +10,8 @@ import pathlib
 import re
 
 
-END_TO_END_NAME = re.compile(r"(?:^|/)EndToEndLatency/(\d+)/(\d+)(?:/|$)")
+END_TO_END_NAME = re.compile(
+    r"(?:^|/)StagedReadyToResultLatency/(\d+)/(\d+)(?:/|$)")
 TIME_TO_MICROSECONDS = {
     "ns": 1.0e-3,
     "us": 1.0,

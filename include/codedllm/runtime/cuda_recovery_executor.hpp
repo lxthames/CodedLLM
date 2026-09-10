@@ -22,6 +22,9 @@ public:
 
   [[nodiscard]] std::optional<std::chrono::microseconds>
   EstimateRecoveryCost() const override;
+  void StageShard(RequestId request_id, std::size_t shard_count,
+                  ShardId shard_id,
+                  const coding::WordShard& payload) override;
   bool Submit(RequestId request_id, DecodePlan plan, coding::ShardSlots shards,
               CompletionHandler completion) override;
   bool Cancel(RequestId request_id) override;

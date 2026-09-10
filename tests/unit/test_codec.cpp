@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace codedllm {
@@ -155,6 +156,86 @@ TEST(CodecTest, CudaDeviceContextExecutesDependentPlanRepeatedly) {
   ASSERT_TRUE(shards.at(3).has_value());
   EXPECT_EQ(*shards.at(2), (WordShard{0xA1B2C3D4U, 0x10131215U}));
   EXPECT_EQ(*shards.at(3), (WordShard{0xA0B0C0D0U, 0x01010101U}));
+}
+
+TEST(CodecTest, CudaStagedContextRecoversShardAfterArrivalUploads) {
+  const std::vector<WordShard> systematic_shards = MakeSystematicShards();
+  const std::vector<WordShard> parity_shards =
+      coding::encode_parity_cpu(MakeThreeDataOneParityGraph(), systematic_shards);
+  ShardSlots shards = {std::nullopt, systematic_shards.at(1),
+                       systematic_shards.at(2), parity_shards.at(0)};
+  std::unique_ptr<DeviceShardStagingContext> context =
+      create_device_shard_staging_context_cuda(shards.size());
+
+  stage_decode_shard_cuda(*context, 1, *shards.at(1));
+  stage_decode_shard_cuda(*context, 2, *shards.at(2));
+  stage_decode_shard_cuda(*context, 3, *shards.at(3));
+  CudaDecodeTimings timings;
+  run_staged_decode_plan_cuda(*context, MakeRecoverFirstShardPlan(), shards,
+                              timings);
+
+  ASSERT_TRUE(shards.at(0).has_value());
+  EXPECT_EQ(*shards.at(0), systematic_shards.at(0));
+  EXPECT_GT(timings.h2d_ms, 0.0F);
+  EXPECT_GT(timings.kernel_ms, 0.0F);
+}
+
+TEST(CodecTest, CudaStagedContextExecutesDependentPlanWithVectorTail) {
+  ShardSlots shards = {
+      WordShard{0x01020304U, 0x11121314U, 0x21222324U, 0x31323334U,
+                0x41424344U},
+      WordShard{0xA0B0C0D0U, 0x01010101U, 0xFFFFFFFFU, 0x12345678U,
+                0x87654321U},
+      std::nullopt, std::nullopt};
+  const DecodePlan plan = {
+      {{/*output=*/2, /*sources=*/{0, 1}},
+       {/*output=*/3, /*sources=*/{2, 0}}},
+      {{}, {0}}, true};
+  std::unique_ptr<DeviceShardStagingContext> context =
+      create_device_shard_staging_context_cuda(shards.size());
+  stage_decode_shard_cuda(*context, 0, *shards.at(0));
+  stage_decode_shard_cuda(*context, 1, *shards.at(1));
+
+  CudaDecodeTimings timings;
+  run_staged_decode_plan_cuda(*context, plan, shards, timings);
+
+  ASSERT_TRUE(shards.at(2).has_value());
+  ASSERT_TRUE(shards.at(3).has_value());
+  EXPECT_EQ(*shards.at(2),
+            (WordShard{0xA1B2C3D4U, 0x10131215U, 0xDEDDDCDBU, 0x2306654CU,
+                       0xC6270065U}));
+  EXPECT_EQ(*shards.at(3), *shards.at(1));
+}
+
+TEST(CodecTest, CudaStagedContextRejectsDuplicateShardUpload) {
+  std::unique_ptr<DeviceShardStagingContext> context =
+      create_device_shard_staging_context_cuda(2);
+  const WordShard shard{1, 2, 3};
+
+  stage_decode_shard_cuda(*context, 0, shard);
+
+  EXPECT_THROW(stage_decode_shard_cuda(*context, 0, shard),
+               std::invalid_argument);
+}
+
+TEST(CodecTest, CudaStagedContextRejectsPresentOutputWithoutPoisoningPlan) {
+  ShardSlots shards = {WordShard{0x01020304U, 0x11121314U},
+                       WordShard{0xA0B0C0D0U, 0x01010101U},
+                       WordShard{0xDEADBEEFU, 0x12345678U}};
+  const DecodePlan plan = {{{/*output=*/2, /*sources=*/{0, 1}}}, {{}}, true};
+  std::unique_ptr<DeviceShardStagingContext> context =
+      create_device_shard_staging_context_cuda(shards.size());
+  stage_decode_shard_cuda(*context, 0, *shards.at(0));
+  stage_decode_shard_cuda(*context, 1, *shards.at(1));
+
+  CudaDecodeTimings timings;
+  EXPECT_THROW(run_staged_decode_plan_cuda(*context, plan, shards, timings),
+               std::invalid_argument);
+
+  shards.at(2).reset();
+  EXPECT_NO_THROW(run_staged_decode_plan_cuda(*context, plan, shards, timings));
+  ASSERT_TRUE(shards.at(2).has_value());
+  EXPECT_EQ(*shards.at(2), (WordShard{0xA1B2C3D4U, 0x10131215U}));
 }
 
 }  // namespace

@@ -51,7 +51,8 @@ class SparseDecoderBenchmark : public benchmark::Fixture {
   coding::ShardSlots MakeIterationShards() const { return initial_shards_; }
 
   void PublishCounters(benchmark::State& state, float h2d_ms, float kernel_ms,
-                       float d2h_ms, std::size_t iterations) const {
+                       float d2h_ms, std::size_t iterations,
+                       const char* h2d_counter = "H2D (ms)") const {
     const double divisor = static_cast<double>(iterations);
     const double average_h2d_ms = h2d_ms / divisor;
     const double average_kernel_ms = kernel_ms / divisor;
@@ -61,7 +62,7 @@ class SparseDecoderBenchmark : public benchmark::Fixture {
 
     // CudaDecodeTimings is measured with cudaEvent_t records immediately around
     // the decoder's H2D, kernel, and D2H phases.
-    state.counters["H2D (ms)"] = average_h2d_ms;
+    state.counters[h2d_counter] = average_h2d_ms;
     state.counters["Kernel (ms)"] = average_kernel_ms;
     state.counters["D2H (ms)"] = average_d2h_ms;
     state.counters["Bandwidth (GB/s)"] = average_kernel_ms > 0.0
@@ -100,6 +101,49 @@ BENCHMARK_DEFINE_F(SparseDecoderBenchmark, EndToEndLatency)
 
   PublishCounters(state, total_h2d_ms, total_kernel_ms, total_d2h_ms,
                   iterations);
+}
+
+BENCHMARK_DEFINE_F(SparseDecoderBenchmark, StagedReadyToResultLatency)
+(benchmark::State& state) {
+  float total_h2d_ms = 0.0F;
+  float total_kernel_ms = 0.0F;
+  float total_d2h_ms = 0.0F;
+  std::size_t iterations = 0;
+
+  for (auto _ : state) {
+    state.PauseTiming();
+    coding::ShardSlots shards = MakeIterationShards();
+    std::unique_ptr<DeviceShardStagingContext> context =
+        create_device_shard_staging_context_cuda(shards.size());
+    for (std::size_t shard_id = 0; shard_id < shards.size(); ++shard_id) {
+      if (shards.at(shard_id).has_value()) {
+        stage_decode_shard_cuda(*context, static_cast<ShardId>(shard_id),
+                                *shards.at(shard_id));
+      }
+    }
+    synchronize_staged_shard_uploads_cuda(*context);
+    state.ResumeTiming();
+
+    CudaDecodeTimings timings;
+    run_staged_decode_plan_cuda(*context, plan_, shards, timings);
+
+    state.PauseTiming();
+    for (const XorOperation& operation : plan_.operations) {
+      if (shards.at(operation.output) != expected_shards_.at(operation.output)) {
+        state.SkipWithError("Staged decode result is incorrect");
+        break;
+      }
+    }
+    context.reset();
+    total_h2d_ms += timings.h2d_ms;
+    total_kernel_ms += timings.kernel_ms;
+    total_d2h_ms += timings.d2h_ms;
+    ++iterations;
+    state.ResumeTiming();
+  }
+
+  PublishCounters(state, total_h2d_ms, total_kernel_ms, total_d2h_ms,
+                  iterations, "Staged H2D (ms)");
 }
 
 BENCHMARK_DEFINE_F(SparseDecoderBenchmark, KernelOnlyLatency)
@@ -170,6 +214,7 @@ constexpr std::int64_t kSixteenMiB = 16 * kOneMiB;
       ->Args({8, kSixteenMiB + 4})
 
 REGISTER_DECODER_BENCHMARKS(EndToEndLatency);
+REGISTER_DECODER_BENCHMARKS(StagedReadyToResultLatency);
 REGISTER_DECODER_BENCHMARKS(KernelOnlyLatency)
     ->UseManualTime()
     ->Iterations(100);

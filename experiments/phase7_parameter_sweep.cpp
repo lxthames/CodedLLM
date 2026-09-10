@@ -421,7 +421,7 @@ void PrintRow(const std::string& scenario, std::uint32_t seed,
             << k << ',' << m << ',' << degree << ',' << shard_size_mib << ','
             << workload.straggler_probability << ',' << queue_depth << ','
             << concurrency << ',' << strategy << ',' << added_shard_count << ','
-            << storage_overhead_percent << ',' << "end_to_end_cuda_benchmark_v1" << ','
+            << storage_overhead_percent << ',' << "staged_ready_to_result_cuda_benchmark_v1" << ','
             << summary.p50_us << ',' << summary.p95_us << ',' << summary.p99_us << ','
             << summary.admission_rate_percent << ',' << summary.rejection_rate_percent
             << ',' << summary.wait_rate_percent << ','

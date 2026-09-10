@@ -37,7 +37,7 @@ def make_row(seed, strategy, p99_us, *, added=None, overhead=None, scenario="pri
         "strategy": strategy,
         "added_shard_count": str(added),
         "storage_overhead_pct": str(overhead),
-        "decode_cost_model": "end_to_end_cuda_benchmark_v1",
+        "decode_cost_model": "staged_ready_to_result_cuda_benchmark_v1",
         "p50_us": str(p99_us // 2),
         "p95_us": str(p99_us - 10),
         "p99_us": str(p99_us),

@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 *.ncu-rep
 CLAUDE.md
+/docs
+/tmp

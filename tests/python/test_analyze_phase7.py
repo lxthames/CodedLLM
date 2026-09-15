@@ -130,6 +130,12 @@ class Phase7AnalysisTest(unittest.TestCase):
         self.assertFalse(negative["wait_p99_interval_supported"])
         self.assertEqual(negative["conclusion_scope"], "exploratory")
 
+        for row in (positive, zero, negative):
+            self.assertIn("capacity_replication_p99_interval_supported", row)
+            self.assertIn("full_replication_p99_interval_supported", row)
+            self.assertIsInstance(row["capacity_replication_p99_interval_supported"], bool)
+            self.assertIsInstance(row["full_replication_p99_interval_supported"], bool)
+
 
 if __name__ == "__main__":
     unittest.main()

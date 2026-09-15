@@ -220,6 +220,11 @@ add_test(
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_extract_phase7_decode_costs.py
 )
+add_test(
+  NAME RepeatedGpuLatencyAnalysisTest
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_repeat_gpu_latency.py
+)
 
 add_executable(phase7_parameter_sweep
   experiments/phase7_parameter_sweep.cpp

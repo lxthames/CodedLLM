@@ -253,10 +253,10 @@ CONCLUSION_FIELDS = (
     "wait_p99_interval_supported",
     "capacity_replication_p99_delta_mean_us",
     "capacity_replication_p99_delta_ci95_us",
-    "capacity_replication_interval_supported",
+    "capacity_replication_p99_interval_supported",
     "full_replication_p99_delta_mean_us",
     "full_replication_p99_delta_ci95_us",
-    "full_replication_interval_supported",
+    "full_replication_p99_interval_supported",
     "conclusion_scope",
 )
 
